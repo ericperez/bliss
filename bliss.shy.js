@@ -1,6 +1,31 @@
 (function() {
 "use strict";
 
+function overload(callback, start, end) {
+	start = start === undefined ? 1 : start;
+	end = end || start + 1;
+
+	if (end - start <= 1) {
+		return function() {
+			if ($.type(arguments[start]) === 'string') {
+				return callback.apply(this, arguments);
+			}
+
+			var obj = arguments[start], ret;
+
+			for (var key in obj) {
+				var args = Array.from(arguments);
+				args.splice(start, 1, key, obj[key]);
+				ret = callback.apply(this, args);
+			}
+
+			return ret;
+		};
+	}
+
+	return overload(overload(callback, start + 1, end), start, end - 1);
+}
+
 // Copy properties from one object to another. Overwrites allowed.
 function extend(to, from, whitelist) {
 	for (var property in from) {
@@ -37,17 +62,20 @@ var $ = self.Bliss = extend(function(expr, context) {
 extend($, {
 	extend: extend,
 
+	overload: overload,
+
 	property: $.property || "_",
 
 	sources: {},
+
+	noop: function(){},
 
 	$: function(expr, context) {
 		if (expr instanceof Node || expr instanceof Window) {
 			return [expr];
 		}
 
-		// In the future, we should use Array.from() instead of Array.prototype.slice.call()
-		return Array.prototype.slice.call(typeof expr == "string"? (context || document).querySelectorAll(expr) : expr || []);
+		return Array.from(typeof expr == "string"? (context || document).querySelectorAll(expr) : expr || []);
 	},
 
 	/**
@@ -79,17 +107,29 @@ extend($, {
 	},
 
 	create: function (tag, o) {
+		// 4 signatures: (tag, o), (tag), (o), ()
 		if (arguments.length === 1) {
 			if ($.type(tag) === "string") {
-				return document.createTextNode(tag);
+				o = {};
 			}
-
-			o = tag;
-			tag = o.tag;
-			delete o.tag;
+			else {
+				o = tag;
+				tag = o.tag;
+				o = $.extend({}, o, function(property) { return property !== "tag"; });
+			}
 		}
 
 		return $.set(document.createElement(tag || "div"), o);
+	},
+
+	each: function(obj, callback, ret) {
+		ret = ret || {};
+
+		for (var property in obj) {
+			ret[property] = callback.call(obj, property, obj[property]);
+		}
+
+		return ret;
 	},
 
 	ready: function(context) {
@@ -109,8 +149,12 @@ extend($, {
 
 	// Helper for defining OOP-like “classes”
 	Class: function(o) {
-		var init = o.constructor || function(){};
-		delete o.constructor;
+		var init = $.noop;
+
+		if (o.hasOwnProperty("constructor")) {
+			init = o.constructor;
+			delete o.constructor;
+		}
 
 		var abstract = o.abstract;
 		delete o.abstract;
@@ -132,7 +176,7 @@ extend($, {
 		ret.super = o.extends || null;
 		delete o.extends;
 
-		ret.prototype = $.extend(Object.create(ret.super && ret.super.prototype), {
+		ret.prototype = $.extend(Object.create(ret.super? ret.super.prototype : Object), {
 			constructor: ret
 		});
 
@@ -159,54 +203,43 @@ extend($, {
 	// Properties with special handling in classes
 	classProps: {
 		// Lazily evaluated properties
-		lazy: function(obj, property, getter) {
-			if (arguments.length >= 3) {
-				Object.defineProperty(obj, property, {
-					get: function() {
-						// FIXME this does not work for instances if property is defined on the prototype
-						delete this[property];
-
-						return this[property] = getter.call(this);
-					},
-					configurable: true,
-					enumerable: true
-				});
-			}
-			else if (arguments.length === 2) {
-				for (var prop in property) {
-					$.lazy(obj, prop, property[prop]);
-				}
-			}
-
+		lazy: overload(function(obj, property, getter) {
+			Object.defineProperty(obj, property, {
+				get: function() {
+					// FIXME this does not work for instances if property is defined on the prototype
+					delete this[property];
+					return this[property] = getter.call(this);
+				},
+				configurable: true,
+				enumerable: true
+			});
 			return obj;
-		},
+		}),
 
 		// Properties that behave like normal properties but also execute code upon getting/setting
-		live: function(obj, property, descriptor) {
-			if (arguments.length >= 3) {
-				Object.defineProperty(obj, property, {
-					get: function() {
-						var value = this["_" + property];
-						var ret = descriptor.get && descriptor.get.call(this, value);
-						return ret !== undefined? ret : value;
-					},
-					set: function(v) {
-						var value = this["_" + property];
-						var ret = descriptor.set && descriptor.set.call(this, v, value);
-						this["_" + property] = ret !== undefined? ret : v;
-					},
-					configurable: descriptor.configurable,
-					enumerable: descriptor.enumerable
-				});
-			}
-			else if (arguments.length === 2) {
-				for (var prop in property) {
-					$.live(obj, prop, property[prop]);
-				}
+		live: overload(function(obj, property, descriptor) {
+			if ($.type(descriptor) === "function") {
+				descriptor = {set: descriptor};
 			}
 
+			Object.defineProperty(obj, property, {
+				get: function() {
+					var value = this["_" + property];
+					var ret = descriptor.get && descriptor.get.call(this, value);
+					return ret !== undefined? ret : value;
+				},
+				set: function(v) {
+					var value = this["_" + property];
+					var ret = descriptor.set && descriptor.set.call(this, v, value);
+					this["_" + property] = ret !== undefined? ret : v;
+				},
+				configurable: descriptor.configurable,
+				enumerable: descriptor.enumerable
+			});
+
 			return obj;
-		},
+		})
+
 	},
 
 	// Includes a script, returns a promise
@@ -242,30 +275,32 @@ extend($, {
 		}
 
 		// Set defaults & fixup arguments
-		url = new URL(url, location);
-		o = o || {};
-		o.data = o.data || '';
-		o.method = o.method || 'GET';
-		o.headers = o.headers || {};
+		var env = extend({
+			url: new URL(url, location),
+			data: "",
+			method: "GET",
+			headers: {},
+			xhr: new XMLHttpRequest()
+		}, o);
 
-		var xhr = new XMLHttpRequest();
+		env.method = env.method.toUpperCase();
 
-		if ($.type(o.data) !== "string") {
-			o.data = Object.keys(o.data).map(function(key){ return key + "=" + encodeURIComponent(o.data[key]); }).join("&");
+		$.hooks.run("fetch-args", env);
+
+		// Start sending the request
+
+		if (env.method === "GET" && env.data) {
+			env.url.search += env.data;
 		}
 
-		if (o.method === "GET" && o.data) {
-			url.search += o.data;
-		}
+		document.body.setAttribute('data-loading', env.url);
 
-		document.body.setAttribute('data-loading', url);
-
-		xhr.open(o.method, url, !o.sync);
+		env.xhr.open(env.method, env.url.href, env.async !== false, env.user, env.password);
 
 		for (var property in o) {
-			if (property in xhr) {
+			if (property in env.xhr) {
 				try {
-					xhr[property] = o[property];
+					env.xhr[property] = o[property];
 				}
 				catch (e) {
 					self.console && console.error(e);
@@ -273,37 +308,60 @@ extend($, {
 			}
 		}
 
-		if (o.method !== 'GET' && !o.headers['Content-type'] && !o.headers['Content-Type']) {
-			xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+		if (env.method !== 'GET' && !env.headers['Content-type'] && !env.headers['Content-Type']) {
+			env.xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
 		}
 
-		for (var header in o.headers) {
-			xhr.setRequestHeader(header, o.headers[header]);
+		for (var header in env.headers) {
+			env.xhr.setRequestHeader(header, env.headers[header]);
 		}
 
 		return new Promise(function(resolve, reject){
-			xhr.onload = function(){
+			env.xhr.onload = function(){
 				document.body.removeAttribute('data-loading');
 
-				if (xhr.status === 0 || xhr.status >= 200 && xhr.status < 300 || xhr.status === 304) {
+				if (env.xhr.status === 0 || env.xhr.status >= 200 && env.xhr.status < 300 || env.xhr.status === 304) {
 					// Success!
-					resolve(xhr);
+					resolve(env.xhr);
 				}
 				else {
-					reject(Error(xhr.statusText));
+					reject(Error(env.xhr.statusText));
 				}
 
 			};
 
-			xhr.onerror = function() {
+			env.xhr.onerror = function() {
 				document.body.removeAttribute('data-loading');
 				reject(Error("Network Error"));
 			};
 
-			xhr.send(o.method === 'GET'? null : o.data);
+			env.xhr.send(env.method === 'GET'? null : env.data);
+		});
+	},
+
+	value: function(obj) {
+		var hasRoot = $.type(obj) !== "string";
+
+		return $$(arguments).slice(+hasRoot).reduce(function(obj, property) {
+	        return obj && obj[property];
+	    }, hasRoot? obj : self);
+	}
+});
+
+$.Hooks = new $.Class({
+	add: function (name, callback) {
+		this[name] = this[name] || [];
+		this[name].push(callback);
+	},
+
+	run: function (name, env) {
+		(this[name] || []).forEach(function(callback) {
+			callback(env);
 		});
 	}
 });
+
+$.hooks = new $.Hooks();
 
 var _ = $.property;
 
@@ -318,27 +376,19 @@ $.Element = function (subject) {
 };
 
 $.Element.prototype = {
-	set: function (properties) {
-		if ($.type(arguments[0]) === "string") {
-			properties = {};
-			properties[arguments[0]] = arguments[1];
+	set: overload(function(property, value) {
+
+		if (property in $.setProps) {
+			$.setProps[property].call(this, value);
+		}
+		else if (property in this) {
+			this[property] = value;
+		}
+		else {
+			this.setAttribute(property, value);
 		}
 
-		for (var property in properties) {
-			if (property in $.setProps) {
-				$.setProps[property].call(this, properties[property]);
-			}
-			else if (property in this) {
-				this[property] = properties[property];
-			}
-			else {
-				if (!this.setAttribute) {
-					console.log(this);
-				}
-				this.setAttribute(property, properties[property]);
-			}
-		}
-	},
+	}, 0),
 
 	// Run a CSS transition, return promise
 	transition: function(props, duration) {
@@ -437,57 +487,41 @@ $.setProps = {
 		}
 	},
 
-	once: function(val) {
-		if (arguments.length == 2) {
-			val = {};
-			val[arguments[0]] = arguments[1];
-		}
+	once: overload(function(events, callback){
+		events = events.split(/\s+/);
+		var me = this;
+		var once = function() {
+			events.forEach(function(event){
+				me.removeEventListener(event, once);
+			});
 
-		for (var events in val) {
-			events.split(/\s+/).forEach(function (event) {
-				var me = this;
-				this.addEventListener(event, function callback() {
-					me.removeEventListener(event, callback);
-					return val[events].apply(this, arguments);
-				});
-			}, this);
-		}
-	},
+			return callback.apply(me, arguments);
+		};
+
+		events.forEach(function (event) {
+			me.addEventListener(event, once);
+		});
+	}, 0),
 
 	// Event delegation
-	delegate: function(val) {
-		if (arguments.length === 3) {
-			// Called with ("type", "selector", callback)
-			val = {};
-			val[arguments[0]] = {};
-			val[arguments[0]][arguments[1]] = arguments[2];
-		}
-		else if (arguments.length === 2) {
-			// Called with ("type", selectors & callbacks)
-			val = {};
-			val[arguments[0]] = arguments[1];
-		}
-
-		var element = this;
-
-		for (var type in val) {
-			(function (type, callbacks) {
-				element.addEventListener(type, function(evt) {
-					for (var selector in callbacks) {
-						if (evt.target.matches(selector)) { // Do ancestors count?
-							callbacks[selector].call(this, evt);
-						}
-					}
-				});
-			})(type, val[type]);
-		}
-	},
+	delegate: overload(function (type, selector, callback) {
+		this.addEventListener(type, function(evt) {
+			if (evt.target.closest(selector)) {
+				callback.call(this, evt);
+			}
+		});
+	}, 0, 2),
 
 	// Set the contents as a string, an element, an object to create an element or an array of these
 	contents: function (val) {
 		if (val || val === 0) {
 			(Array.isArray(val)? val : [val]).forEach(function (child) {
-				if (/^(string|number|object)$/.test($.type(child))) {
+				var type = $.type(child);
+
+				if (/^(string|number)$/.test(type)) {
+					child = document.createTextNode(child + "");
+				}
+				else if (type === "object") {
 					child = $.create(child);
 				}
 
@@ -541,52 +575,40 @@ $.Array.prototype = {
 };
 
 // Extends Bliss with more methods
-$.add = function (methods, on, noOverwrite) {
+$.add = overload(function(method, callback, on, noOverwrite) {
 	on = $.extend({$: true, element: true, array: true}, on);
 
-	if ($.type(arguments[0]) === "string") {
-		methods = {};
-		methods[arguments[0]] = arguments[1];
-	}
-
-	for (var method in methods) {
-		// In the future, we should use let instead of a closure
-		(function(method, callback){
-
-		if ($.type(callback) == "function") {
-			if (on.element && (!(method in $.Element.prototype) || !noOverwrite)) {
-				$.Element.prototype[method] = function () {
-					return this.subject && $.defined(callback.apply(this.subject, arguments), this.subject);
-				};
-			}
-
-			if (on.array && (!(method in $.Array.prototype) || !noOverwrite)) {
-				$.Array.prototype[method] = function() {
-					var args = arguments;
-					return this.subject.map(function(element) {
-						return element && $.defined(callback.apply(element, args), element);
-					});
-				};
-			}
-
-			if (on.$) {
-				$.sources[method] = $[method] = callback;
-
-				if (on.array || on.element) {
-					$[method] = function () {
-						var args = [].slice.apply(arguments);
-						var subject = args.shift();
-						var Type = on.array && Array.isArray(subject)? "Array" : "Element";
-
-						return $[Type].prototype[method].apply({subject: subject}, args);
-					};
-				}
-			}
+	if ($.type(callback) == "function") {
+		if (on.element && (!(method in $.Element.prototype) || !noOverwrite)) {
+			$.Element.prototype[method] = function () {
+				return this.subject && $.defined(callback.apply(this.subject, arguments), this.subject);
+			};
 		}
 
-		})(method, methods[method]);
+		if (on.array && (!(method in $.Array.prototype) || !noOverwrite)) {
+			$.Array.prototype[method] = function() {
+				var args = arguments;
+				return this.subject.map(function(element) {
+					return element && $.defined(callback.apply(element, args), element);
+				});
+			};
+		}
+
+		if (on.$) {
+			$.sources[method] = $[method] = callback;
+
+			if (on.array || on.element) {
+				$[method] = function () {
+					var args = [].slice.apply(arguments);
+					var subject = args.shift();
+					var Type = on.array && Array.isArray(subject)? "Array" : "Element";
+
+					return $[Type].prototype[method].apply({subject: subject}, args);
+				};
+			}
+		}
 	}
-};
+}, 0);
 
 $.add($.Array.prototype, {element: false});
 $.add($.Element.prototype);
